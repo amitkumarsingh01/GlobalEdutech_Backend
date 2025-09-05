@@ -1831,14 +1831,21 @@ async def get_payment_history(user_id: str):
     """
     Get all payment history for a user from our database.
     """
+    # Convert user_id to ObjectId if it's a valid ObjectId, otherwise keep as string
+    try:
+        user_object_id = ObjectId(user_id)
+        user_query = {"user_id": user_object_id}
+    except:
+        user_query = {"user_id": user_id}
+    
     # Get payment links created by this user
     payment_links = []
-    async for link in db.payment_links.find({"user_id": user_id}).sort("created_at", -1):
+    async for link in db.payment_links.find(user_query).sort("created_at", -1):
         payment_links.append(serialize_object(link))
     
     # Get payment status records for this user
     payment_statuses = []
-    async for status in db.payment_status.find({"user_id": user_id}).sort("checked_at", -1):
+    async for status in db.payment_status.find(user_query).sort("checked_at", -1):
         payment_statuses.append(serialize_object(status))
     
     return {
