@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends, status
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
@@ -10,8 +10,15 @@ from datetime import datetime, timedelta
 import hashlib
 import jwt
 import os
+import random
 from enum import Enum
 import shutil
+import base64
+import json
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
+import asyncio
+import time
 
 # FastAPI App
 app = FastAPI(title="VIDYARTHI MITRAA API", version="1.0.0")
@@ -57,6 +64,13 @@ os.makedirs(os.path.join(UPLOAD_DIR, "carousel"), exist_ok=True)
 # App Feature Flags / Runtime Config
 # Simple in-memory toggle for dual-login feature
 DUAL_LOGIN_ENABLED = False
+
+# Razorpay credentials (set these as environment variables in deployment)
+# RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID") // rzp_live_RD1TqHaORLWnO5
+# RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET") // R3KcI2buGSQyuD5SvM5GT6hk
+
+RAZORPAY_KEY_ID = "rzp_live_RD1TqHaORLWnO5"
+RAZORPAY_KEY_SECRET = "R3KcI2buGSQyuD5SvM5GT6hk"
 
 # Helper Functions
 def hash_password(password: str) -> str:
@@ -107,6 +121,85 @@ def serialize_object(obj):
     if isinstance(obj, list):
         return [serialize_object(item) for item in obj]
     return obj
+
+# Background task for payment status polling
+async def poll_payment_status():
+    """
+    Background task that polls payment status every 10 minutes for 15 minutes
+    """
+    while True:
+        try:
+            # Get all pending payment links created in the last 15 minutes
+            fifteen_minutes_ago = datetime.utcnow() - timedelta(minutes=15)
+            
+            pending_payments = []
+            async for payment in db.payment_links.find({
+                "status": {"$in": ["created", "pending"]},
+                "created_at": {"$gte": fifteen_minutes_ago}
+            }):
+                pending_payments.append(payment)
+            
+            # Update status for each pending payment
+            for payment in pending_payments:
+                try:
+                    payment_id = payment["payment_id"]
+                    
+                    # Check payment status with Razorpay
+                    if payment_id.startswith("plink_"):
+                        api_url = f"https://api.razorpay.com/v1/payment_links/{payment_id}"
+                    else:
+                        api_url = f"https://api.razorpay.com/v1/orders/{payment_id}"
+                    
+                    # Create auth header
+                    credentials = f"{os.getenv('RAZORPAY_KEY_ID', 'rzp_test_123')}:{os.getenv('RAZORPAY_KEY_SECRET', 'secret')}"
+                    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                    
+                    req = urlrequest.Request(api_url)
+                    req.add_header("Authorization", f"Basic {encoded_credentials}")
+                    req.add_header("Content-Type", "application/json")
+                    
+                    with urlrequest.urlopen(req) as response:
+                        rdata = json.loads(response.read().decode())
+                        
+                        # Update payment status in database
+                        update_data = {
+                            "status": rdata.get("status", "unknown"),
+                            "updated_at": datetime.utcnow()
+                        }
+                        
+                        if rdata.get("status") == "paid":
+                            update_data["paid_at"] = datetime.utcnow()
+                        elif rdata.get("status") == "failed":
+                            update_data["failure_reason"] = rdata.get("error_description", "Payment failed")
+                        
+                        await db.payment_links.update_one(
+                            {"payment_id": payment_id},
+                            {"$set": update_data}
+                        )
+                        
+                        # Also update payment_status collection
+                        await db.payment_status.update_one(
+                            {"payment_id": payment_id},
+                            {
+                                "$set": {
+                                    "status": rdata.get("status", "unknown"),
+                                    "checked_at": datetime.utcnow(),
+                                    "updated_at": datetime.utcnow()
+                                }
+                            },
+                            upsert=True
+                        )
+                        
+                except Exception as e:
+                    print(f"Error updating payment {payment_id}: {str(e)}")
+                    continue
+            
+            # Wait 10 minutes before next poll
+            await asyncio.sleep(600)  # 10 minutes = 600 seconds
+            
+        except Exception as e:
+            print(f"Error in payment polling: {str(e)}")
+            await asyncio.sleep(60)  # Wait 1 minute on error
 
 # Pydantic Models
 class UserRegistration(BaseModel):
@@ -209,6 +302,34 @@ class CurrentAffairsCreate(BaseModel):
 
 class DualLoginUpdate(BaseModel):
     duallogin: bool
+
+class RazorpayStatusRequest(BaseModel):
+    payment_id: str  # Just the payment_id from Razorpay
+
+class RazorpayLinkCreateRequest(BaseModel):
+    user_id: str
+    product_type: str  # e.g., course, test, material
+    product_id: str
+    amount: float  # in INR
+
+class PaymentHistoryResponse(BaseModel):
+    payment_id: str
+    user_id: str
+    product_type: str
+    product_id: str
+    amount: float
+    status: str
+    payment_link: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    paid_at: Optional[datetime] = None
+    failure_reason: Optional[str] = None
+
+class PaymentStatusUpdate(BaseModel):
+    payment_id: str
+    status: str
+    paid_at: Optional[datetime] = None
+    failure_reason: Optional[str] = None
 
 # File Upload Helper
 async def save_file(file: UploadFile, folder: str) -> str:
@@ -1581,6 +1702,258 @@ async def add_course_feedback(course_id: str, feedback_data: dict, user_id: str 
     
     return {"message": "Course feedback added successfully"}
 
+# =============== PAYMENTS (RAZORPAY) ===============
+
+@app.post("/payments/razorpay/link")
+async def razorpay_create_payment_link(payload: RazorpayLinkCreateRequest):
+    """
+    Create a Razorpay Payment Link and return its id and short_url.
+    Docs: https://razorpay.com/docs/api/payment-links/
+    """
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay credentials not configured")
+
+    api_url = "https://api.razorpay.com/v1/payment_links"
+    credentials = f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode("utf-8")
+    auth_header = base64.b64encode(credentials).decode("utf-8")
+
+    # Amount in paise (integer)
+    amount_paise = int(round(payload.amount * 100))
+
+    # Create a shorter reference_id (max 40 chars)
+    ref_id = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=10))
+    
+    body = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "description": f"{payload.product_type}:{payload.product_id}",
+        "reference_id": ref_id,
+        "notify": {"sms": False, "email": False},
+        "callback_method": "get",
+        # Optional: add your frontend callback URL if available
+        # "callback_url": "https://your-frontend.com/payment/callback",
+        "notes": {
+            "user_id": payload.user_id,
+            "product_type": payload.product_type,
+            "product_id": payload.product_id,
+        },
+    }
+
+    data = json.dumps(body).encode("utf-8")
+    req = urlrequest.Request(api_url, data=data, method="POST")
+    req.add_header("Authorization", f"Basic {auth_header}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+
+    try:
+        with urlrequest.urlopen(req, timeout=20) as resp:
+            rdata = json.loads(resp.read().decode("utf-8"))
+            link_id = rdata.get("id")
+            link_url = rdata.get("short_url") or rdata.get("payment_url") or rdata.get("status_link")
+
+            # Upsert record
+            record = {
+                "user_id": ObjectId(payload.user_id) if ObjectId.is_valid(payload.user_id) else payload.user_id,
+                "product_type": payload.product_type,
+                "product_id": payload.product_id,
+                "gateway": "razorpay",
+                "amount": payload.amount,
+                "link_id": link_id,
+                "link_url": link_url,
+                "raw": rdata,
+                "status": rdata.get("status"),
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            await db.payment_links.update_one(
+                {"link_id": link_id, "gateway": "razorpay"},
+                {"$set": record},
+                upsert=True,
+            )
+
+            return {"message": "Payment link created", "payment_id": link_id, "payment_link": link_url}
+    except HTTPError as e:
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            error_body = str(e)
+        raise HTTPException(status_code=e.code or 502, detail=f"Razorpay error: {error_body}")
+    except URLError as e:
+        raise HTTPException(status_code=502, detail=f"Network error contacting Razorpay: {str(e.reason)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create payment link: {str(e)}")
+
+@app.post("/payments/razorpay/status")
+async def razorpay_payment_status(payload: RazorpayStatusRequest):
+    """
+    Check Razorpay payment status by payment_id only.
+    Returns: created, paid, pending, etc.
+    """
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay credentials not configured")
+
+    # Try Payment Links API first (plink_*), then Orders API
+    if payload.payment_id.startswith("plink_"):
+        api_url = f"https://api.razorpay.com/v1/payment_links/{payload.payment_id}"
+    else:
+        api_url = f"https://api.razorpay.com/v1/orders/{payload.payment_id}"
+    
+    credentials = f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode("utf-8")
+    auth_header = base64.b64encode(credentials).decode("utf-8")
+
+    req = urlrequest.Request(api_url, method="GET")
+    req.add_header("Authorization", f"Basic {auth_header}")
+    req.add_header("Accept", "application/json")
+
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            status = data.get("status", "unknown")
+            
+            return {
+                "payment_id": payload.payment_id,
+                "status": status,
+                "raw_data": data
+            }
+    except HTTPError as e:
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            error_body = str(e)
+        raise HTTPException(status_code=e.code or 502, detail=f"Razorpay error: {error_body}")
+    except URLError as e:
+        raise HTTPException(status_code=502, detail=f"Network error contacting Razorpay: {str(e.reason)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch payment status: {str(e)}")
+
+@app.get("/payments/history/{user_id}")
+async def get_payment_history(user_id: str):
+    """
+    Get all payment history for a user from our database.
+    """
+    # Get payment links created by this user
+    payment_links = []
+    async for link in db.payment_links.find({"user_id": user_id}).sort("created_at", -1):
+        payment_links.append(serialize_object(link))
+    
+    # Get payment status records for this user
+    payment_statuses = []
+    async for status in db.payment_status.find({"user_id": user_id}).sort("checked_at", -1):
+        payment_statuses.append(serialize_object(status))
+    
+    return {
+        "user_id": user_id,
+        "payment_links": payment_links,
+        "payment_statuses": payment_statuses
+    }
+
+@app.get("/payments/history")
+async def get_all_payment_history(
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    product_type: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """
+    Get all payment history from the database (not user-specific).
+    Supports filtering by status, product_type, and date range.
+    """
+    # Build filter query
+    filter_query = {}
+    
+    if status:
+        filter_query["status"] = status
+    if product_type:
+        filter_query["product_type"] = product_type
+    
+    # Date range filtering
+    if start_date or end_date:
+        date_filter = {}
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            date_filter["$gte"] = start_dt
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+            date_filter["$lte"] = end_dt
+        filter_query["created_at"] = date_filter
+    
+    # Get payment links with filters
+    payment_links = []
+    async for link in db.payment_links.find(filter_query).sort("created_at", -1).skip(offset).limit(limit):
+        payment_links.append(serialize_object(link))
+    
+    # Get total count for pagination
+    total_count = await db.payment_links.count_documents(filter_query)
+    
+    return {
+        "payment_links": payment_links,
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+        "filters": {
+            "status": status,
+            "product_type": product_type,
+            "start_date": start_date,
+            "end_date": end_date
+        }
+    }
+
+@app.get("/payments/stats")
+async def get_payment_stats():
+    """
+    Get payment statistics and analytics.
+    """
+    # Total payments
+    total_payments = await db.payment_links.count_documents({})
+    
+    # Payments by status
+    status_stats = {}
+    status_pipeline = [
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
+    ]
+    async for stat in db.payment_links.aggregate(status_pipeline):
+        status_stats[stat["_id"]] = stat["count"]
+    
+    # Payments by product type
+    product_stats = {}
+    product_pipeline = [
+        {"$group": {"_id": "$product_type", "count": {"$sum": 1}}}
+    ]
+    async for stat in db.payment_links.aggregate(product_pipeline):
+        product_stats[stat["_id"]] = stat["count"]
+    
+    # Revenue by status
+    revenue_pipeline = [
+        {"$group": {
+            "_id": "$status",
+            "total_amount": {"$sum": "$amount"},
+            "count": {"$sum": 1}
+        }}
+    ]
+    revenue_stats = {}
+    async for stat in db.payment_links.aggregate(revenue_pipeline):
+        revenue_stats[stat["_id"]] = {
+            "total_amount": stat["total_amount"],
+            "count": stat["count"]
+        }
+    
+    # Recent payments (last 24 hours)
+    yesterday = datetime.utcnow() - timedelta(days=1)
+    recent_payments = await db.payment_links.count_documents({
+        "created_at": {"$gte": yesterday}
+    })
+    
+    return {
+        "total_payments": total_payments,
+        "status_breakdown": status_stats,
+        "product_type_breakdown": product_stats,
+        "revenue_breakdown": revenue_stats,
+        "recent_payments_24h": recent_payments,
+        "generated_at": datetime.utcnow().isoformat()
+    }
+
 # =============== FILE UPLOAD ROUTES ===============
 
 @app.post("/upload/image")
@@ -1684,6 +2057,17 @@ async def bulk_create_materials(materials_data: List[MaterialCreate]):
     
     result = await db.materials.insert_many(materials_list)
     return {"message": f"{len(result.inserted_ids)} materials created successfully"}
+
+# =============== STARTUP EVENT ===============
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Start background tasks when the application starts
+    """
+    # Start payment polling task
+    asyncio.create_task(poll_payment_status())
+    print("Payment polling background task started")
 
 # =============== RUN SERVER ===============
 
