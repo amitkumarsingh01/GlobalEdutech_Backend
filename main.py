@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr
 from bson import ObjectId
@@ -24,6 +25,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Static Files
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 # MongoDB Connection
 MONGODB_URL = "mongodb://localhost:27017"
 DATABASE_NAME = "vidyarthi_mitraa"
@@ -38,6 +42,21 @@ security = HTTPBearer()
 # Upload Directory
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Create all required subdirectories
+os.makedirs(os.path.join(UPLOAD_DIR, "testimonials"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "students"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "images"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "videos"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "pdfs"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "profiles"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "materials"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "courses"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "carousel"), exist_ok=True)
+
+# App Feature Flags / Runtime Config
+# Simple in-memory toggle for dual-login feature
+DUAL_LOGIN_ENABLED = False
 
 # Helper Functions
 def hash_password(password: str) -> str:
@@ -153,6 +172,7 @@ class MaterialCreate(BaseModel):
 class OnlineTestCreate(BaseModel):
     class_name: str
     course: str
+    sub_category: str
     subject: str
     module: str
     test_title: str
@@ -161,8 +181,9 @@ class OnlineTestCreate(BaseModel):
     total_marks: int
     duration: int
     difficulty_level: str
-    time_period: int
     pass_mark: int
+    validity_days: int
+    price: float
 
 class TestQuestionCreate(BaseModel):
     test_id: str
@@ -186,9 +207,13 @@ class CurrentAffairsCreate(BaseModel):
     publish_date: str
     importance: str = "Medium"
 
+class DualLoginUpdate(BaseModel):
+    duallogin: bool
+
 # File Upload Helper
 async def save_file(file: UploadFile, folder: str) -> str:
     file_path = os.path.join(UPLOAD_DIR, folder, file.filename)
+    # Ensure the directory exists
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -529,7 +554,12 @@ async def delete_institution(institution_id: str):
 
 @app.post("/testimonials")
 async def create_testimonial(
-    testimonial: TestimonialCreate,
+    title: str = Form(...),
+    description: str = Form(...),
+    student_name: str = Form(...),
+    course: str = Form(...),
+    rating: int = Form(5),
+    media_type: str = Form(...),
     media_file: UploadFile = File(...),
     student_image: Optional[UploadFile] = File(None)
 ):
@@ -539,7 +569,12 @@ async def create_testimonial(
         student_image_url = await save_file(student_image, "students")
     
     testimonial_dict = {
-        **testimonial.dict(),
+        "title": title,
+        "description": description,
+        "student_name": student_name,
+        "course": course,
+        "rating": rating,
+        "media_type": media_type,
         "media_url": media_url,
         "student_image": student_image_url,
         "is_active": True,
@@ -587,16 +622,32 @@ async def delete_testimonial(testimonial_id: str):
 
 @app.post("/courses")
 async def create_course(
-    course: CourseCreate,
+    name: str = Form(...),
+    title: str = Form(...),
+    description: str = Form(...),
+    category: str = Form(...),
+    sub_category: str = Form(...),
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    duration: str = Form(...),
+    instructor: str = Form(...),
+    price: float = Form(0),
     thumbnail: UploadFile = File(...)
 ):
     thumbnail_url = await save_file(thumbnail, "courses")
     
     course_dict = {
-        **course.dict(),
+        "name": name,
+        "title": title,
+        "description": description,
+        "category": category,
+        "sub_category": sub_category,
+        "start_date": datetime.fromisoformat(start_date.replace('Z', '+00:00')),
+        "end_date": datetime.fromisoformat(end_date.replace('Z', '+00:00')),
+        "duration": duration,
+        "instructor": instructor,
+        "price": price,
         "thumbnail_image": thumbnail_url,
-        "start_date": datetime.fromisoformat(course.start_date.replace('Z', '+00:00')),
-        "end_date": datetime.fromisoformat(course.end_date.replace('Z', '+00:00')),
         "enrolled_students": 0,
         "status": "active",
         "is_featured": False,
@@ -643,13 +694,29 @@ async def delete_course(course_id: str):
 
 @app.post("/materials")
 async def create_material(
-    material: MaterialCreate,
+    class_name: str = Form(...),
+    course: str = Form(...),
+    sub_category: str = Form(...),
+    module: str = Form(...),
+    title: str = Form(...),
+    description: str = Form(...),
+    academic_year: str = Form(...),
+    time_period: int = Form(...),
+    price: float = Form(0),
     pdf_file: UploadFile = File(...)
 ):
     file_url = await save_file(pdf_file, "materials")
     
     material_dict = {
-        **material.dict(),
+        "class_name": class_name,
+        "course": course,
+        "sub_category": sub_category,
+        "module": module,
+        "title": title,
+        "description": description,
+        "academic_year": academic_year,
+        "time_period": time_period,
+        "price": price,
         "file_url": file_url,
         "file_size": pdf_file.size,
         "download_count": 0,
@@ -722,10 +789,53 @@ async def create_test(test: OnlineTestCreate):
     result = await db.online_tests.insert_one(test_dict)
     return {"message": "Test created", "id": str(result.inserted_id)}
 
+class TestWithQuestionsCreate(BaseModel):
+    test: OnlineTestCreate
+    questions: List[TestQuestionCreate]
+
+@app.post("/tests/with-questions")
+async def create_test_with_questions(data: TestWithQuestionsCreate):
+    # Create the test first
+    test_dict = {
+        **data.test.dict(),
+        "date_published": datetime.utcnow(),
+        "result_type": "Instant",
+        "answer_key": True,
+        "tags": [],
+        "attempts_count": 1,
+        "feedback": [],
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    
+    test_result = await db.online_tests.insert_one(test_dict)
+    test_id = str(test_result.inserted_id)
+    
+    # Create questions
+    questions_list = []
+    for question in data.questions:
+        question_dict = {
+            **question.dict(),
+            "test_id": ObjectId(test_id),
+            "difficulty_level": "Medium",
+            "tags": [],
+            "created_at": datetime.utcnow()
+        }
+        questions_list.append(question_dict)
+    
+    if questions_list:
+        await db.test_questions.insert_many(questions_list)
+    
+    return {"message": "Test with questions created", "test_id": test_id, "questions_count": len(questions_list)}
+
 @app.get("/tests")
 async def get_tests():
     tests = []
     async for test in db.online_tests.find():
+        # Ensure price field exists with default 0 for legacy records
+        if "price" not in test or test.get("price") is None:
+            test["price"] = 0
         tests.append(serialize_object(test))
     return {"tests": tests}
 
@@ -734,6 +844,9 @@ async def get_test(test_id: str):
     test = await db.online_tests.find_one({"_id": ObjectId(test_id)})
     if not test:
         raise HTTPException(status_code=404, detail="Test not found")
+    # Ensure price field exists with default 0 for legacy records
+    if "price" not in test or test.get("price") is None:
+        test["price"] = 0
     return {"test": serialize_object(test)}
 
 @app.put("/tests/{test_id}")
@@ -799,6 +912,30 @@ async def delete_question(question_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Question not found")
     return {"message": "Question deleted successfully"}
+
+@app.put("/test-questions/{question_id}")
+async def update_question(question_id: str, question_data: dict):
+    question_data["updated_at"] = datetime.utcnow()
+    result = await db.test_questions.update_one(
+        {"_id": ObjectId(question_id)},
+        {"$set": question_data}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Question not found")
+    return {"message": "Question updated successfully"}
+
+@app.post("/test-questions")
+async def create_question(question: TestQuestionCreate):
+    question_dict = {
+        **question.dict(),
+        "test_id": ObjectId(question.test_id),
+        "difficulty_level": "Medium",
+        "tags": [],
+        "created_at": datetime.utcnow()
+    }
+    
+    result = await db.test_questions.insert_one(question_dict)
+    return {"message": "Question created", "id": str(result.inserted_id)}
 
 # =============== USER TEST ATTEMPT ROUTES ===============
 
@@ -999,10 +1136,26 @@ async def get_contact():
 
 @app.put("/contact/{contact_id}")
 async def update_contact(contact_id: str, contact_data: dict):
-    contact_data["updated_at"] = datetime.utcnow()
+    # Basic validation
+    if "email" in contact_data and contact_data["email"]:
+        import re
+        email_pattern = r'^[^\s@]+@[^\s@]+\.[^\s@]+$'
+        if not re.match(email_pattern, contact_data["email"]):
+            raise HTTPException(status_code=400, detail="Invalid email format")
+    
+    # Clean up the data - remove empty strings and convert to None
+    cleaned_data = {}
+    for key, value in contact_data.items():
+        if value and str(value).strip():
+            cleaned_data[key] = value.strip()
+        else:
+            cleaned_data[key] = None
+    
+    cleaned_data["updated_at"] = datetime.utcnow()
+    
     result = await db.contacts.update_one(
         {"_id": ObjectId(contact_id)},
-        {"$set": contact_data}
+        {"$set": cleaned_data}
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Contact not found")
@@ -1284,6 +1437,24 @@ async def get_recent_activities():
         "recent_test_attempts": recent_test_attempts
     }
 
+# =============== APP SETTINGS / FEATURE FLAGS ===============
+
+@app.get("/duallogin")
+async def get_dual_login_state():
+    """Return whether dual login is enabled."""
+    return {"duallogin": DUAL_LOGIN_ENABLED}
+
+
+@app.put("/duallogin")
+async def update_dual_login_state(update: DualLoginUpdate):
+    """Update dual login enabled/disabled state.
+
+    Protected by authentication. In a real app, enforce admin authorization.
+    """
+    global DUAL_LOGIN_ENABLED
+    DUAL_LOGIN_ENABLED = update.duallogin
+    return {"message": "Dual login state updated", "duallogin": DUAL_LOGIN_ENABLED}
+
 # =============== SEARCH ROUTES ===============
 
 @app.get("/search/courses")
@@ -1307,18 +1478,18 @@ async def search_courses(query: str = "", category: str = "", limit: int = 10):
     return {"courses": courses}
 
 @app.get("/search/materials")
-async def search_materials(query: str = "", subject: str = "", course: str = "", limit: int = 10):
+async def search_materials(query: str = "", sub_category: str = "", course: str = "", limit: int = 10):
     filter_dict = {}
     
     if query:
         filter_dict["$or"] = [
             {"title": {"$regex": query, "$options": "i"}},
             {"description": {"$regex": query, "$options": "i"}},
-            {"subject": {"$regex": query, "$options": "i"}}
+            {"sub_category": {"$regex": query, "$options": "i"}}
         ]
     
-    if subject:
-        filter_dict["subject"] = subject
+    if sub_category:
+        filter_dict["sub_category"] = sub_category
     
     if course:
         filter_dict["course"] = course
@@ -1435,6 +1606,48 @@ async def upload_pdf(file: UploadFile = File(...)):
     
     file_path = await save_file(file, "pdfs")
     return {"message": "PDF uploaded successfully", "file_path": file_path}
+
+# =============== CAROUSEL ROUTES ===============
+
+@app.post("/carousel")
+async def create_carousel_item(image: UploadFile = File(...)):
+    if not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    image_path = await save_file(image, "carousel")
+    item = {
+        "image_url": image_path,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    result = await db.carousel.insert_one(item)
+    return {"message": "Carousel item created", "id": str(result.inserted_id)}
+
+@app.get("/carousel")
+async def get_carousel_items():
+    items = []
+    async for it in db.carousel.find().sort("created_at", -1):
+        # Normalize fields for frontend contract
+        if "image_url" not in it:
+            it["image_url"] = ""
+        items.append(serialize_object({"_id": it.get("_id"), "image_url": it.get("image_url"), "created_at": it.get("created_at"), "updated_at": it.get("updated_at")}))
+    return {"items": items}
+
+@app.delete("/carousel/{item_id}")
+async def delete_carousel_item(item_id: str):
+    item = await db.carousel.find_one({"_id": ObjectId(item_id)})
+    if not item:
+        raise HTTPException(status_code=404, detail="Carousel item not found")
+    # Attempt to remove the image file (best-effort)
+    try:
+        image_path = item.get("image_url")
+        if image_path and os.path.isfile(image_path):
+            os.remove(image_path)
+    except Exception:
+        pass
+    result = await db.carousel.delete_one({"_id": ObjectId(item_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Carousel item not found")
+    return {"message": "Carousel item deleted"}
 
 # =============== BULK OPERATIONS ROUTES ===============
 

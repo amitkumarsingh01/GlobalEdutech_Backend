@@ -1,6 +1,7 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from enum import Enum
+from datetime import datetime
 from .base import BaseDocument, PyObjectId
 
 class MaterialClassEnum(str, Enum):
@@ -25,7 +26,7 @@ class FeedbackItem(BaseModel):
 class MaterialCreate(BaseModel):
     class_type: MaterialClassEnum = Field(..., alias="class")
     course: str
-    subject: str
+    sub_category: str
     module: str
     title: str
     description: str
@@ -37,7 +38,7 @@ class MaterialCreate(BaseModel):
 class MaterialUpdate(BaseModel):
     class_type: Optional[MaterialClassEnum] = Field(None, alias="class")
     course: Optional[str] = None
-    subject: Optional[str] = None
+    sub_category: Optional[str] = None
     module: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
@@ -52,7 +53,7 @@ class MaterialUpdate(BaseModel):
 class Material(BaseDocument):
     class_type: MaterialClassEnum = Field(..., alias="class")
     course: str
-    subject: str
+    sub_category: str
     module: str
     title: str
     description: str
