@@ -331,6 +331,15 @@ class PaymentStatusUpdate(BaseModel):
     paid_at: Optional[datetime] = None
     failure_reason: Optional[str] = None
 
+class YouTubeVideoCreate(BaseModel):
+    title: str
+    youtube_url: str
+    description: Optional[str] = None
+
+class TextSliderCreate(BaseModel):
+    text: str
+
+
 # File Upload Helper
 async def save_file(file: UploadFile, folder: str) -> str:
     file_path = os.path.join(UPLOAD_DIR, folder, file.filename)
@@ -2037,6 +2046,70 @@ async def delete_carousel_item(item_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Carousel item not found")
     return {"message": "Carousel item deleted"}
+
+# =============== YOUTUBE VIDEO ROUTES ===============
+
+@app.post("/youtube")
+async def create_youtube_video(video: YouTubeVideoCreate):
+    item = {
+        "title": video.title,
+        "youtube_url": video.youtube_url,
+        "description": video.description,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    result = await db.youtube_videos.insert_one(item)
+    return {"message": "YouTube video saved", "id": str(result.inserted_id)}
+
+@app.get("/youtube")
+async def get_youtube_videos():
+    items = []
+    async for it in db.youtube_videos.find().sort("created_at", -1):
+        items.append(serialize_object(it))
+    return {"videos": items}
+
+@app.delete("/youtube/{video_id}")
+async def delete_youtube_video(video_id: str):
+    result = await db.youtube_videos.delete_one({"_id": ObjectId(video_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="YouTube video not found")
+    return {"message": "YouTube video deleted"}
+
+# =============== TEXT SLIDER ROUTES ===============
+
+@app.post("/text-slider")
+async def create_text_slider(item: TextSliderCreate):
+    record = {
+        "text": item.text,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    result = await db.text_slider.insert_one(record)
+    return {"message": "Text added", "id": str(result.inserted_id)}
+
+@app.get("/text-slider")
+async def get_text_slider():
+    items = []
+    async for it in db.text_slider.find().sort("created_at", -1):
+        items.append(serialize_object(it))
+    return {"items": items}
+
+@app.put("/text-slider/{item_id}")
+async def update_text_slider(item_id: str, data: dict):
+    data["updated_at"] = datetime.utcnow()
+    result = await db.text_slider.update_one({"_id": ObjectId(item_id)}, {"$set": data})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Text item not found")
+    return {"message": "Text updated"}
+
+@app.delete("/text-slider/{item_id}")
+async def delete_text_slider(item_id: str):
+    result = await db.text_slider.delete_one({"_id": ObjectId(item_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Text item not found")
+    return {"message": "Text deleted"}
 
 # =============== BULK OPERATIONS ROUTES ===============
 
