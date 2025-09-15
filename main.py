@@ -824,9 +824,17 @@ async def create_material(
     academic_year: str = Form(...),
     time_period: int = Form(...),
     price: float = Form(0),
-    pdf_file: UploadFile = File(...)
+    pdf_file: UploadFile = File(...),
+    sample_images: List[UploadFile] = File(default=[])
 ):
     file_url = await save_file(pdf_file, "materials")
+    
+    # Handle sample images upload
+    sample_image_urls = []
+    for sample_image in sample_images:
+        if sample_image.filename:  # Check if file was actually uploaded
+            sample_url = await save_file(sample_image, "materials/samples")
+            sample_image_urls.append(sample_url)
     
     material_dict = {
         "class_name": class_name,
@@ -840,6 +848,7 @@ async def create_material(
         "price": price,
         "file_url": file_url,
         "file_size": pdf_file.size,
+        "sample_images": sample_image_urls,
         "download_count": 0,
         "tags": [],
         "feedback": [],
