@@ -60,6 +60,7 @@ os.makedirs(os.path.join(UPLOAD_DIR, "profiles"), exist_ok=True)
 os.makedirs(os.path.join(UPLOAD_DIR, "materials"), exist_ok=True)
 os.makedirs(os.path.join(UPLOAD_DIR, "courses"), exist_ok=True)
 os.makedirs(os.path.join(UPLOAD_DIR, "carousel"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "questions"), exist_ok=True)
 
 # App Feature Flags / Runtime Config
 # Simple in-memory toggle for dual-login feature
@@ -69,8 +70,85 @@ DUAL_LOGIN_ENABLED = False
 # RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID") // rzp_live_RD1TqHaORLWnO5
 # RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET") // R3KcI2buGSQyuD5SvM5GT6hk
 
-RAZORPAY_KEY_ID = "rzp_live_RD1TqHaORLWnO5"
-RAZORPAY_KEY_SECRET = "R3KcI2buGSQyuD5SvM5GT6hk"
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "rzp_live_RD1TqHaORLWnO5")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "R3KcI2buGSQyuD5SvM5GT6hk")
+
+def _razorpay_auth_header() -> str:
+    credentials = f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode("utf-8")
+    return base64.b64encode(credentials).decode("utf-8")
+
+def _http_get_json(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
+    req = urlrequest.Request(url, method="GET")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    with urlrequest.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def _determine_paid_from_payment_link(link_data: Dict[str, Any]) -> bool:
+    # Payment Links API returns status transitions like created -> active -> paid
+    status = (link_data.get("status") or link_data.get("payment_status") or "").lower()
+    if status == "paid":
+        return True
+    # Some responses may include payments array
+    payments = link_data.get("payments") or []
+    for p in payments:
+        if (p.get("status") or "").lower() in ["captured", "paid"]:
+            return True
+    return False
+
+def _determine_paid_from_order(order_data: Dict[str, Any], payments_data: Optional[List[Dict[str, Any]]] = None) -> bool:
+    # Orders API: status may be 'paid' when fully paid; otherwise check payments list
+    if (order_data.get("status") or "").lower() == "paid":
+        return True
+    if payments_data:
+        for p in payments_data:
+            if (p.get("status") or "").lower() in ["captured", "paid"]:
+                return True
+    return False
+
+def fetch_razorpay_status(payment_id: str) -> Dict[str, Any]:
+    """Fetch unified payment status for either a payment_link (plink_*) or order id.
+    Returns: { status: str, raw: dict, paid_at?: datetime }
+    """
+    headers = {
+        "Authorization": f"Basic {_razorpay_auth_header()}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    try:
+        if payment_id.startswith("plink_"):
+            api_url = f"https://api.razorpay.com/v1/payment_links/{payment_id}"
+            data = _http_get_json(api_url, headers)
+            is_paid = _determine_paid_from_payment_link(data)
+            return {
+                "status": "paid" if is_paid else (data.get("status") or data.get("payment_status") or "unknown"),
+                "raw": data,
+                "paid_at": datetime.utcnow().isoformat() if is_paid else None,
+            }
+        else:
+            # Orders API
+            order_url = f"https://api.razorpay.com/v1/orders/{payment_id}"
+            order = _http_get_json(order_url, headers)
+            # Check payments under this order
+            payments_url = f"https://api.razorpay.com/v1/orders/{payment_id}/payments"
+            payments_wrapper = _http_get_json(payments_url, headers)
+            payments = payments_wrapper.get("items", []) if isinstance(payments_wrapper, dict) else []
+            is_paid = _determine_paid_from_order(order, payments)
+            return {
+                "status": "paid" if is_paid else (order.get("status") or "unknown"),
+                "raw": {"order": order, "payments": payments},
+                "paid_at": datetime.utcnow().isoformat() if is_paid else None,
+            }
+    except HTTPError as e:
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            body = str(e)
+        raise HTTPException(status_code=e.code or 502, detail=f"Razorpay error: {body}")
+    except URLError as e:
+        raise HTTPException(status_code=502, detail=f"Network error contacting Razorpay: {str(e.reason)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch payment status: {str(e)}")
 
 # Helper Functions
 def hash_password(password: str) -> str:
@@ -125,77 +203,65 @@ def serialize_object(obj):
 # Background task for payment status polling
 async def poll_payment_status():
     """
-    Background task that polls payment status every 10 minutes for 15 minutes
+    Background task that polls payment status every 5 seconds for up to 20 minutes
+    after link creation, or until the status becomes paid/failed.
     """
     while True:
         try:
-            # Get all pending payment links created in the last 15 minutes
-            fifteen_minutes_ago = datetime.utcnow() - timedelta(minutes=15)
+            # Get all pending payment links created in the last 20 minutes
+            twenty_minutes_ago = datetime.utcnow() - timedelta(minutes=20)
             
             pending_payments = []
             async for payment in db.payment_links.find({
-                "status": {"$in": ["created", "pending"]},
-                "created_at": {"$gte": fifteen_minutes_ago}
+                "status": {"$in": ["created", "pending", "issued", "active"]},
+                "created_at": {"$gte": twenty_minutes_ago}
             }):
                 pending_payments.append(payment)
+            print(f"[poll] cycle @ {datetime.utcnow().isoformat()} | pending={len(pending_payments)}")
             
             # Update status for each pending payment
             for payment in pending_payments:
+                # Ensure we have an identifier even if an exception happens below
+                payment_id = payment.get("payment_id") or payment.get("link_id")
+                key_name = "payment_id" if payment.get("payment_id") else ("link_id" if payment.get("link_id") else None)
+                if not payment_id or not key_name:
+                    # Skip malformed records
+                    continue
                 try:
-                    payment_id = payment["payment_id"]
-                    
-                    # Check payment status with Razorpay
-                    if payment_id.startswith("plink_"):
-                        api_url = f"https://api.razorpay.com/v1/payment_links/{payment_id}"
-                    else:
-                        api_url = f"https://api.razorpay.com/v1/orders/{payment_id}"
-                    
-                    # Create auth header
-                    credentials = f"{os.getenv('RAZORPAY_KEY_ID', 'rzp_test_123')}:{os.getenv('RAZORPAY_KEY_SECRET', 'secret')}"
-                    encoded_credentials = base64.b64encode(credentials.encode()).decode()
-                    
-                    req = urlrequest.Request(api_url)
-                    req.add_header("Authorization", f"Basic {encoded_credentials}")
-                    req.add_header("Content-Type", "application/json")
-                    
-                    with urlrequest.urlopen(req) as response:
-                        rdata = json.loads(response.read().decode())
-                        
-                        # Update payment status in database
-                        update_data = {
-                            "status": rdata.get("status", "unknown"),
-                            "updated_at": datetime.utcnow()
-                        }
-                        
-                        if rdata.get("status") == "paid":
-                            update_data["paid_at"] = datetime.utcnow()
-                        elif rdata.get("status") == "failed":
-                            update_data["failure_reason"] = rdata.get("error_description", "Payment failed")
-                        
-                        await db.payment_links.update_one(
-                            {"payment_id": payment_id},
-                            {"$set": update_data}
-                        )
-                        
-                        # Also update payment_status collection
-                        await db.payment_status.update_one(
-                            {"payment_id": payment_id},
-                            {
-                                "$set": {
-                                    "status": rdata.get("status", "unknown"),
-                                    "checked_at": datetime.utcnow(),
-                                    "updated_at": datetime.utcnow()
-                                }
-                            },
-                            upsert=True
-                        )
+                    # Unified status check
+                    status_info = fetch_razorpay_status(payment_id)
+                    new_status = status_info.get("status", "unknown")
+                    print(f"[poll] update {payment_id} -> {new_status}")
+                    update_data = {
+                        "status": new_status,
+                        "updated_at": datetime.utcnow(),
+                        "raw_last": status_info.get("raw"),
+                    }
+                    if new_status == "paid" and status_info.get("paid_at"):
+                        update_data["paid_at"] = datetime.utcnow()
+
+                    await db.payment_links.update_one({key_name: payment_id}, {"$set": update_data})
+
+                    await db.payment_status.update_one(
+                        {"payment_id": payment_id},
+                        {
+                            "$set": {
+                                "status": new_status,
+                                "checked_at": datetime.utcnow(),
+                                "updated_at": datetime.utcnow(),
+                                "raw": status_info.get("raw"),
+                            }
+                        },
+                        upsert=True
+                    )
                         
                 except Exception as e:
-                    print(f"Error updating payment {payment_id}: {str(e)}")
+                    safe_id = payment_id if payment_id else "<unknown>"
+                    print(f"Error updating payment {safe_id}: {str(e)}")
                     continue
             
-            # Wait 10 minutes before next poll
-            await asyncio.sleep(600)  # 10 minutes = 600 seconds
+            # Wait 5 seconds before next poll
+            await asyncio.sleep(5)
             
         except Exception as e:
             print(f"Error in payment polling: {str(e)}")
@@ -286,6 +352,7 @@ class TestQuestionCreate(BaseModel):
     correct_answer: str
     explanation: Optional[str] = None
     marks: int = 1
+    image_url: Optional[str] = None
 
 class NotificationCreate(BaseModel):
     title: str
@@ -1009,10 +1076,37 @@ async def delete_test(test_id: str):
 # =============== TEST QUESTION ROUTES ===============
 
 @app.post("/test-questions")
-async def create_question(question: TestQuestionCreate):
+async def create_question(
+    test_id: str = Form(...),
+    question_number: int = Form(...),
+    question: str = Form(...),
+    options: str = Form(...),  # JSON string
+    correct_answer: str = Form(...),
+    explanation: Optional[str] = Form(None),
+    marks: int = Form(1),
+    image: Optional[UploadFile] = File(None)
+):
+    # Parse options JSON
+    import json
+    try:
+        options_list = json.loads(options)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid options format")
+    
+    # Handle image upload
+    image_url = None
+    if image and image.filename:
+        image_url = await save_file(image, "questions")
+    
     question_dict = {
-        **question.dict(),
-        "test_id": ObjectId(question.test_id),
+        "test_id": ObjectId(test_id),
+        "question_number": question_number,
+        "question": question,
+        "options": options_list,
+        "correct_answer": correct_answer,
+        "explanation": explanation,
+        "marks": marks,
+        "image_url": image_url,
         "difficulty_level": "Medium",
         "tags": [],
         "created_at": datetime.utcnow()
@@ -1036,7 +1130,50 @@ async def get_question(question_id: str):
     return {"question": serialize_object(question)}
 
 @app.put("/test-questions/{question_id}")
-async def update_question(question_id: str, question_data: dict):
+async def update_question(
+    question_id: str,
+    test_id: str = Form(...),
+    question_number: int = Form(...),
+    question: str = Form(...),
+    options: str = Form(...),  # JSON string
+    correct_answer: str = Form(...),
+    explanation: Optional[str] = Form(None),
+    marks: int = Form(1),
+    image: Optional[UploadFile] = File(None)
+):
+    # Parse options JSON
+    import json
+    try:
+        options_list = json.loads(options)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid options format")
+    
+    # Handle image upload
+    image_url = None
+    if image and image.filename:
+        image_url = await save_file(image, "questions")
+    
+    # Get existing question to preserve image_url if no new image is uploaded
+    existing_question = await db.test_questions.find_one({"_id": ObjectId(question_id)})
+    if not existing_question:
+        raise HTTPException(status_code=404, detail="Question not found")
+    
+    # If no new image uploaded, keep existing image_url
+    if not image_url and existing_question.get("image_url"):
+        image_url = existing_question["image_url"]
+    
+    question_data = {
+        "test_id": ObjectId(test_id),
+        "question_number": question_number,
+        "question": question,
+        "options": options_list,
+        "correct_answer": correct_answer,
+        "explanation": explanation,
+        "marks": marks,
+        "image_url": image_url,
+        "updated_at": datetime.utcnow()
+    }
+    
     result = await db.test_questions.update_one(
         {"_id": ObjectId(question_id)},
         {"$set": question_data}
@@ -1051,30 +1188,6 @@ async def delete_question(question_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Question not found")
     return {"message": "Question deleted successfully"}
-
-@app.put("/test-questions/{question_id}")
-async def update_question(question_id: str, question_data: dict):
-    question_data["updated_at"] = datetime.utcnow()
-    result = await db.test_questions.update_one(
-        {"_id": ObjectId(question_id)},
-        {"$set": question_data}
-    )
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Question not found")
-    return {"message": "Question updated successfully"}
-
-@app.post("/test-questions")
-async def create_question(question: TestQuestionCreate):
-    question_dict = {
-        **question.dict(),
-        "test_id": ObjectId(question.test_id),
-        "difficulty_level": "Medium",
-        "tags": [],
-        "created_at": datetime.utcnow()
-    }
-    
-    result = await db.test_questions.insert_one(question_dict)
-    return {"message": "Question created", "id": str(result.inserted_id)}
 
 # =============== USER TEST ATTEMPT ROUTES ===============
 
@@ -1282,13 +1395,26 @@ async def update_contact(contact_id: str, contact_data: dict):
         if not re.match(email_pattern, contact_data["email"]):
             raise HTTPException(status_code=400, detail="Invalid email format")
     
-    # Clean up the data - remove empty strings and convert to None
-    cleaned_data = {}
+    # Clean up the data - trim strings; preserve objects; convert empty strings to None
+    cleaned_data: Dict[str, Any] = {}
     for key, value in contact_data.items():
-        if value and str(value).strip():
-            cleaned_data[key] = value.strip()
-        else:
+        if isinstance(value, str):
+            trimmed = value.strip()
+            cleaned_data[key] = trimmed if trimmed else None
+        elif isinstance(value, dict):
+            # Clean nested dictionaries (e.g., social_media)
+            nested: Dict[str, Any] = {}
+            for sk, sv in value.items():
+                if isinstance(sv, str):
+                    tsv = sv.strip()
+                    nested[sk] = tsv if tsv else None
+                else:
+                    nested[sk] = sv
+            cleaned_data[key] = nested
+        elif value is None:
             cleaned_data[key] = None
+        else:
+            cleaned_data[key] = value
     
     cleaned_data["updated_at"] = datetime.utcnow()
     
@@ -1666,9 +1792,13 @@ async def search_tests(query: str = "", subject: str = "", difficulty: str = "",
 
 @app.post("/feedback/material/{material_id}")
 async def add_material_feedback(material_id: str, feedback_data: dict, user_id: str = Depends(get_current_user)):
+    # Resolve user name for display
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    user_name = user.get("name") if user else None
     feedback = {
         "user_id": ObjectId(user_id),
-        "rating": feedback_data["rating"],
+        "user_name": user_name,
+        "rating": feedback_data.get("rating", 0),
         "comment": feedback_data.get("comment", ""),
         "created_at": datetime.utcnow()
     }
@@ -1685,9 +1815,12 @@ async def add_material_feedback(material_id: str, feedback_data: dict, user_id: 
 
 @app.post("/feedback/test/{test_id}")
 async def add_test_feedback(test_id: str, feedback_data: dict, user_id: str = Depends(get_current_user)):
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    user_name = user.get("name") if user else None
     feedback = {
         "user_id": ObjectId(user_id),
-        "rating": feedback_data["rating"],
+        "user_name": user_name,
+        "rating": feedback_data.get("rating", 0),
         "comment": feedback_data.get("comment", ""),
         "created_at": datetime.utcnow()
     }
@@ -1704,20 +1837,34 @@ async def add_test_feedback(test_id: str, feedback_data: dict, user_id: str = De
 
 @app.post("/feedback/course/{course_id}")
 async def add_course_feedback(course_id: str, feedback_data: dict, user_id: str = Depends(get_current_user)):
+    """
+    Add feedback for a course directly on the course document (no enrollment required).
+    Stored structure mirrors material feedback: { user_id, rating, comment, created_at }.
+    """
+    # Validate course exists
+    course = await db.courses.find_one({"_id": ObjectId(course_id)})
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    # Build feedback entry
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    user_name = user.get("name") if user else None
     feedback = {
-        "rating": feedback_data["rating"],
+        "user_id": ObjectId(user_id),
+        "user_name": user_name,
+        "rating": feedback_data.get("rating", 0),
         "comment": feedback_data.get("comment", ""),
-        "feedback_date": datetime.utcnow()
+        "created_at": datetime.utcnow(),
     }
-    
-    result = await db.user_enrollments.update_one(
-        {"user_id": ObjectId(user_id), "course_id": ObjectId(course_id)},
-        {"$set": {"feedback": feedback, "updated_at": datetime.utcnow()}}
+
+    result = await db.courses.update_one(
+        {"_id": ObjectId(course_id)},
+        {"$push": {"feedback": feedback}, "$set": {"updated_at": datetime.utcnow()}}
     )
-    
+
     if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Enrollment not found")
-    
+        raise HTTPException(status_code=500, detail="Failed to add course feedback")
+
     return {"message": "Course feedback added successfully"}
 
 # =============== PAYMENTS (RAZORPAY) ===============
@@ -1748,8 +1895,9 @@ async def razorpay_create_payment_link(payload: RazorpayLinkCreateRequest):
         "reference_id": ref_id,
         "notify": {"sms": False, "email": False},
         "callback_method": "get",
-        # Optional: add your frontend callback URL if available
-        # "callback_url": "https://your-frontend.com/payment/callback",
+        # Mobile deep link callback (Android intent-filter added for myapp://razorpay/payment)
+        # Razorpay will append query params like payment_id/order_id/status
+        "callback_url": f"myapp://razorpay/payment?ref_id={ref_id}",
         "notes": {
             "user_id": payload.user_id,
             "product_type": payload.product_type,
@@ -1805,44 +1953,26 @@ async def razorpay_create_payment_link(payload: RazorpayLinkCreateRequest):
 async def razorpay_payment_status(payload: RazorpayStatusRequest):
     """
     Check Razorpay payment status by payment_id only.
-    Returns: created, paid, pending, etc.
+    Returns unified status (created/pending/active/paid/failed) with raw payloads.
     """
     if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         raise HTTPException(status_code=500, detail="Razorpay credentials not configured")
 
-    # Try Payment Links API first (plink_*), then Orders API
-    if payload.payment_id.startswith("plink_"):
-        api_url = f"https://api.razorpay.com/v1/payment_links/{payload.payment_id}"
-    else:
-        api_url = f"https://api.razorpay.com/v1/orders/{payload.payment_id}"
-    
-    credentials = f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode("utf-8")
-    auth_header = base64.b64encode(credentials).decode("utf-8")
-
-    req = urlrequest.Request(api_url, method="GET")
-    req.add_header("Authorization", f"Basic {auth_header}")
-    req.add_header("Accept", "application/json")
-
-    try:
-        with urlrequest.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            status = data.get("status", "unknown")
-            
-            return {
-                "payment_id": payload.payment_id,
-                "status": status,
-                "raw_data": data
+    status_info = fetch_razorpay_status(payload.payment_id)
+    # Persist a status snapshot for quick GET queries
+    await db.payment_status.update_one(
+        {"payment_id": payload.payment_id},
+        {
+            "$set": {
+                "status": status_info.get("status"),
+                "checked_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "raw": status_info.get("raw"),
             }
-    except HTTPError as e:
-        try:
-            error_body = e.read().decode("utf-8")
-        except Exception:
-            error_body = str(e)
-        raise HTTPException(status_code=e.code or 502, detail=f"Razorpay error: {error_body}")
-    except URLError as e:
-        raise HTTPException(status_code=502, detail=f"Network error contacting Razorpay: {str(e.reason)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch payment status: {str(e)}")
+        },
+        upsert=True,
+    )
+    return {"payment_id": payload.payment_id, **status_info}
 
 @app.get("/payments/history/{user_id}")
 async def get_payment_history(user_id: str):
@@ -1861,10 +1991,15 @@ async def get_payment_history(user_id: str):
     async for link in db.payment_links.find(user_query).sort("created_at", -1):
         payment_links.append(serialize_object(link))
     
-    # Get payment status records for this user
+    # Get payment status records for this user (join by payment_id in links)
     payment_statuses = []
-    async for status in db.payment_status.find(user_query).sort("checked_at", -1):
-        payment_statuses.append(serialize_object(status))
+    for link in payment_links:
+        pid = link.get("link_id") or link.get("payment_id")
+        if not pid:
+            continue
+        status = await db.payment_status.find_one({"payment_id": pid})
+        if status:
+            payment_statuses.append(serialize_object(status))
     
     return {
         "user_id": user_id,
