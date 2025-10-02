@@ -154,17 +154,21 @@ def fetch_razorpay_status(payment_id: str) -> Dict[str, Any]:
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
-def create_jwt_token(user_id: str) -> str:
+def create_jwt_token(user_id: str, session_id: str) -> str:
     payload = {
         "user_id": user_id,
+        "session_id": session_id,
         "exp": datetime.utcnow() + timedelta(days=30)
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-def verify_jwt_token(token: str) -> str:
+def verify_jwt_token(token: str) -> dict:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("user_id")
+        return {
+            "user_id": payload.get("user_id"),
+            "session_id": payload.get("session_id")
+        }
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.JWTError:
@@ -184,10 +188,67 @@ async def verify_google_token(id_token: str) -> dict:
         raise HTTPException(status_code=401, detail=f"Google token verification failed: {str(e)}")
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    user_id = verify_jwt_token(credentials.credentials)
-    if not user_id:
+    token_data = verify_jwt_token(credentials.credentials)
+    user_id = token_data.get("user_id")
+    session_id = token_data.get("session_id")
+    
+    if not user_id or not session_id:
         raise HTTPException(status_code=401, detail="Invalid authentication")
+    
+    # Validate session is still active
+    session = await db.user_sessions.find_one({
+        "user_id": ObjectId(user_id),
+        "session_id": session_id,
+        "is_active": True
+    })
+    
+    if not session:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    
     return user_id
+
+# Session Management Functions
+async def create_user_session(user_id: str, device_info: dict = None) -> str:
+    """Create a new user session and invalidate previous sessions"""
+    import uuid
+    
+    # Generate unique session ID
+    session_id = str(uuid.uuid4())
+    
+    # Invalidate all previous sessions for this user
+    await db.user_sessions.update_many(
+        {"user_id": ObjectId(user_id)},
+        {"$set": {"is_active": False, "ended_at": datetime.utcnow()}}
+    )
+    
+    # Create new session
+    session_data = {
+        "user_id": ObjectId(user_id),
+        "session_id": session_id,
+        "is_active": True,
+        "device_info": device_info or {},
+        "created_at": datetime.utcnow(),
+        "last_activity": datetime.utcnow(),
+        "ended_at": None
+    }
+    
+    await db.user_sessions.insert_one(session_data)
+    return session_id
+
+async def invalidate_user_session(user_id: str, session_id: str):
+    """Invalidate a specific user session"""
+    await db.user_sessions.update_one(
+        {
+            "user_id": ObjectId(user_id),
+            "session_id": session_id
+        },
+        {
+            "$set": {
+                "is_active": False,
+                "ended_at": datetime.utcnow()
+            }
+        }
+    )
 
 def serialize_object(obj):
     if isinstance(obj, ObjectId):
@@ -437,7 +498,10 @@ async def register_user(user_data: UserRegistration):
     }
     
     result = await db.users.insert_one(user_dict)
-    token = create_jwt_token(str(result.inserted_id))
+    
+    # Create new session for this user
+    session_id = await create_user_session(str(result.inserted_id))
+    token = create_jwt_token(str(result.inserted_id), session_id)
     
     return {
         "message": "User registered successfully",
@@ -457,7 +521,10 @@ async def login_user(login_data: UserLogin):
         {"$set": {"last_login": datetime.utcnow()}}
     )
     
-    token = create_jwt_token(str(user["_id"]))
+    # Create new session (this will invalidate previous sessions)
+    session_id = await create_user_session(str(user["_id"]))
+    token = create_jwt_token(str(user["_id"]), session_id)
+    
     return {
         "message": "Login successful",
         "user_id": str(user["_id"]),
@@ -497,7 +564,10 @@ async def google_auth(google_data: GoogleAuth):
             
             # Get updated user data
             updated_user = await db.users.find_one({"_id": existing_user["_id"]})
-            token = create_jwt_token(str(existing_user["_id"]))
+            
+            # Create new session (this will invalidate previous sessions)
+            session_id = await create_user_session(str(existing_user["_id"]))
+            token = create_jwt_token(str(existing_user["_id"]), session_id)
             
             return {
                 "message": "Google authentication successful",
@@ -526,7 +596,10 @@ async def google_auth(google_data: GoogleAuth):
             }
             
             result = await db.users.insert_one(user_dict)
-            token = create_jwt_token(str(result.inserted_id))
+            
+            # Create new session for this user
+            session_id = await create_user_session(str(result.inserted_id))
+            token = create_jwt_token(str(result.inserted_id), session_id)
             
             # Get the created user data
             new_user = await db.users.find_one({"_id": result.inserted_id})
@@ -540,6 +613,22 @@ async def google_auth(google_data: GoogleAuth):
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")
+
+@app.post("/auth/logout")
+async def logout_user(current_user_id: str = Depends(get_current_user)):
+    """Logout user and invalidate current session"""
+    try:
+        # Get current session info from token
+        # Note: We need to extract session_id from the current request
+        # For now, we'll invalidate all sessions for this user
+        await db.user_sessions.update_many(
+            {"user_id": ObjectId(current_user_id)},
+            {"$set": {"is_active": False, "ended_at": datetime.utcnow()}}
+        )
+        
+        return {"message": "Logged out successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Logout failed: {str(e)}")
 
 @app.post("/auth/link-google")
 async def link_google_account(link_data: dict, current_user_id: str = Depends(get_current_user)):
@@ -1086,7 +1175,7 @@ async def create_question(
     explanation: Optional[str] = Form(None),
     marks: int = Form(1),
     image: Optional[UploadFile] = File(None),
-    description_images: Optional[List[UploadFile]] = File(None)
+    description_images: List[UploadFile] = File(default=[])
 ):
     # Parse options JSON
     import json
@@ -1102,11 +1191,16 @@ async def create_question(
     
     # Handle multiple description images
     description_image_urls = []
-    if description_images:
+    if description_images and len(description_images) > 0:
         for desc_image in description_images:
-            if desc_image and desc_image.filename:
-                desc_image_url = await save_file(desc_image, "questions")
-                description_image_urls.append(desc_image_url)
+            # Check if file exists and has content
+            if desc_image and desc_image.filename and desc_image.filename.strip():
+                try:
+                    desc_image_url = await save_file(desc_image, "questions")
+                    description_image_urls.append(desc_image_url)
+                except Exception as e:
+                    print(f"Error saving description image: {e}")
+                    continue
     
     question_dict = {
         "test_id": ObjectId(test_id),
@@ -1151,7 +1245,7 @@ async def update_question(
     explanation: Optional[str] = Form(None),
     marks: int = Form(1),
     image: Optional[UploadFile] = File(None),
-    description_images: Optional[List[UploadFile]] = File(None)
+    description_images: List[UploadFile] = File(default=[])
 ):
     # Parse options JSON
     import json
@@ -1167,11 +1261,16 @@ async def update_question(
     
     # Handle multiple description images
     description_image_urls = []
-    if description_images:
+    if description_images and len(description_images) > 0:
         for desc_image in description_images:
-            if desc_image and desc_image.filename:
-                desc_image_url = await save_file(desc_image, "questions")
-                description_image_urls.append(desc_image_url)
+            # Check if file exists and has content
+            if desc_image and desc_image.filename and desc_image.filename.strip():
+                try:
+                    desc_image_url = await save_file(desc_image, "questions")
+                    description_image_urls.append(desc_image_url)
+                except Exception as e:
+                    print(f"Error saving description image: {e}")
+                    continue
     
     # Get existing question to preserve image_url and description_images if no new ones are uploaded
     existing_question = await db.test_questions.find_one({"_id": ObjectId(question_id)})

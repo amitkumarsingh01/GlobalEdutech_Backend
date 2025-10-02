@@ -171,7 +171,7 @@ The API returns appropriate HTTP status codes and error messages:
 
 ### Test Google Authentication:
 ```bash
-curl -X POST "http://localhost:8000/auth/google" \
+curl -X POST "https://server.globaledutechlearn.com/auth/google" \
   -H "Content-Type: application/json" \
   -d '{
     "firebase_uid": "test_firebase_uid",
@@ -184,7 +184,7 @@ curl -X POST "http://localhost:8000/auth/google" \
 
 ### Test Profile Update:
 ```bash
-curl -X PUT "http://localhost:8000/users/{user_id}/profile" \
+curl -X PUT "https://server.globaledutechlearn.com/users/{user_id}/profile" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <jwt_token>" \
   -d '{
