@@ -171,7 +171,7 @@ def verify_jwt_token(token: str) -> dict:
         }
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
+    except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 async def verify_google_token(id_token: str) -> dict:
@@ -192,8 +192,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user_id = token_data.get("user_id")
     session_id = token_data.get("session_id")
     
-    if not user_id or not session_id:
+    if not user_id:
         raise HTTPException(status_code=401, detail="Invalid authentication")
+    
+    # If token doesn't have session_id (old token), require re-login
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Please login again - session required")
     
     # Validate session is still active
     session = await db.user_sessions.find_one({
@@ -203,7 +207,13 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     })
     
     if not session:
-        raise HTTPException(status_code=401, detail="Session expired or invalid")
+        raise HTTPException(status_code=401, detail="Session expired or invalid - logged in from another device")
+    
+    # Update last activity
+    await db.user_sessions.update_one(
+        {"user_id": ObjectId(user_id), "session_id": session_id},
+        {"$set": {"last_activity": datetime.utcnow()}}
+    )
     
     return user_id
 
@@ -215,11 +225,21 @@ async def create_user_session(user_id: str, device_info: dict = None) -> str:
     # Generate unique session ID
     session_id = str(uuid.uuid4())
     
+    # Count existing active sessions before invalidation
+    existing_sessions = await db.user_sessions.count_documents({
+        "user_id": ObjectId(user_id),
+        "is_active": True
+    })
+    
+    print(f"🔐 User {user_id} login: Found {existing_sessions} existing active sessions")
+    
     # Invalidate all previous sessions for this user
-    await db.user_sessions.update_many(
+    result = await db.user_sessions.update_many(
         {"user_id": ObjectId(user_id)},
         {"$set": {"is_active": False, "ended_at": datetime.utcnow()}}
     )
+    
+    print(f"🔐 Invalidated {result.modified_count} previous sessions for user {user_id}")
     
     # Create new session
     session_data = {
@@ -233,6 +253,8 @@ async def create_user_session(user_id: str, device_info: dict = None) -> str:
     }
     
     await db.user_sessions.insert_one(session_data)
+    print(f"🔐 Created new session {session_id} for user {user_id}")
+    
     return session_id
 
 async def invalidate_user_session(user_id: str, session_id: str):
@@ -613,6 +635,26 @@ async def google_auth(google_data: GoogleAuth):
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")
+
+@app.get("/auth/check-session")
+async def check_session_validity(current_user_id: str = Depends(get_current_user)):
+    """Check if current session is valid - used for app startup validation"""
+    try:
+        # If we reach here, the session is valid (get_current_user validates it)
+        user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        return {
+            "valid": True,
+            "message": "Session is active",
+            "user": serialize_object(user)
+        }
+    except HTTPException as e:
+        # Re-raise HTTP exceptions (like 401 from get_current_user)
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session check failed: {str(e)}")
 
 @app.post("/auth/logout")
 async def logout_user(current_user_id: str = Depends(get_current_user)):
