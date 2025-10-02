@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from enum import Enum
 from datetime import datetime
@@ -37,6 +37,7 @@ class TestQuestionCreate(BaseModel):
     marks: int = 1
     difficulty_level: DifficultyEnum = DifficultyEnum.medium
     tags: Optional[List[str]] = []
+    description_images: Optional[List[str]] = []
 
 class OnlineTestCreate(BaseModel):
     class_name: str = Field(..., alias="class")

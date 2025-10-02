@@ -1026,6 +1026,7 @@ async def create_test_with_questions(data: TestWithQuestionsCreate):
             "test_id": ObjectId(test_id),
             "difficulty_level": "Medium",
             "tags": [],
+            "description_images": question.description_images or [],
             "created_at": datetime.utcnow()
         }
         questions_list.append(question_dict)
@@ -1084,7 +1085,8 @@ async def create_question(
     correct_answer: str = Form(...),
     explanation: Optional[str] = Form(None),
     marks: int = Form(1),
-    image: Optional[UploadFile] = File(None)
+    image: Optional[UploadFile] = File(None),
+    description_images: Optional[List[UploadFile]] = File(None)
 ):
     # Parse options JSON
     import json
@@ -1098,6 +1100,14 @@ async def create_question(
     if image and image.filename:
         image_url = await save_file(image, "questions")
     
+    # Handle multiple description images
+    description_image_urls = []
+    if description_images:
+        for desc_image in description_images:
+            if desc_image and desc_image.filename:
+                desc_image_url = await save_file(desc_image, "questions")
+                description_image_urls.append(desc_image_url)
+    
     question_dict = {
         "test_id": ObjectId(test_id),
         "question_number": question_number,
@@ -1107,6 +1117,7 @@ async def create_question(
         "explanation": explanation,
         "marks": marks,
         "image_url": image_url,
+        "description_images": description_image_urls,
         "difficulty_level": "Medium",
         "tags": [],
         "created_at": datetime.utcnow()
@@ -1139,7 +1150,8 @@ async def update_question(
     correct_answer: str = Form(...),
     explanation: Optional[str] = Form(None),
     marks: int = Form(1),
-    image: Optional[UploadFile] = File(None)
+    image: Optional[UploadFile] = File(None),
+    description_images: Optional[List[UploadFile]] = File(None)
 ):
     # Parse options JSON
     import json
@@ -1153,7 +1165,15 @@ async def update_question(
     if image and image.filename:
         image_url = await save_file(image, "questions")
     
-    # Get existing question to preserve image_url if no new image is uploaded
+    # Handle multiple description images
+    description_image_urls = []
+    if description_images:
+        for desc_image in description_images:
+            if desc_image and desc_image.filename:
+                desc_image_url = await save_file(desc_image, "questions")
+                description_image_urls.append(desc_image_url)
+    
+    # Get existing question to preserve image_url and description_images if no new ones are uploaded
     existing_question = await db.test_questions.find_one({"_id": ObjectId(question_id)})
     if not existing_question:
         raise HTTPException(status_code=404, detail="Question not found")
@@ -1161,6 +1181,10 @@ async def update_question(
     # If no new image uploaded, keep existing image_url
     if not image_url and existing_question.get("image_url"):
         image_url = existing_question["image_url"]
+    
+    # If no new description images uploaded, keep existing ones
+    if not description_image_urls and existing_question.get("description_images"):
+        description_image_urls = existing_question["description_images"]
     
     question_data = {
         "test_id": ObjectId(test_id),
@@ -1171,6 +1195,7 @@ async def update_question(
         "explanation": explanation,
         "marks": marks,
         "image_url": image_url,
+        "description_images": description_image_urls,
         "updated_at": datetime.utcnow()
     }
     
